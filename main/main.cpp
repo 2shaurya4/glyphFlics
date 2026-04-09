@@ -598,6 +598,7 @@ static void tof_task(void *arg) {
     gpio_set_direction((gpio_num_t)PUMP_A_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)PUMP_B_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)PUMP_C_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)0, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)PUMP_A_GPIO, 0);
     gpio_set_level((gpio_num_t)PUMP_B_GPIO, 0);
     gpio_set_level((gpio_num_t)PUMP_C_GPIO, 0);
