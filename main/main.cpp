@@ -685,15 +685,22 @@ static void tof_task(void *arg) {
 
             case DISPENSE_PUMPING:
                 if ((now - pump_start_time) >= PUMP_RUN_TIME_MS) {
-                    if (g_active_pump_gpio >= 0) {
-                        gpio_set_level((gpio_num_t)g_active_pump_gpio, 0);
-                    }
-                    g_active_pump_gpio = -1;
-                    cooldown_start = now;
-                    g_dispense_state = DISPENSE_COOLDOWN;
-                    ESP_LOGI(TAG, "Pump OFF. Cooldown...");
+                if (g_active_pump_gpio >= 0) {
+                    gpio_set_level((gpio_num_t)g_active_pump_gpio, 0);
+                }
+                g_active_pump_gpio = -1;
+
+                // Pulse GPIO 0 high for 1 second
+                gpio_set_level((gpio_num_t)0, 1);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                gpio_set_level((gpio_num_t)0, 0);
+
+                cooldown_start = esp_timer_get_time() / 1000;  // refresh timestamp after delay
+                g_dispense_state = DISPENSE_COOLDOWN;
+                ESP_LOGI(TAG, "Pump OFF. GPIO 0 pulsed. Cooldown...");
                 }
                 break;
+
 
             case DISPENSE_COOLDOWN:
                 if ((now - cooldown_start) >= COOLDOWN_TIME_MS) {
