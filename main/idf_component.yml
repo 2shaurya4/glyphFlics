@@ -1,0 +1,3 @@
+dependencies:
+  espressif/led_strip: "^3.0.0"
+  adithya-187326/bno055: "^1.0.1"
