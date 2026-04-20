@@ -1,24 +1,22 @@
 /*
- * Drink Dispenser: Fluid Sim + VL53L0X + Multi-Pump Control
+ * Drink Dispenser: Fluid Sim + VL53L0X + Carbonated Water + Flavor Pumps
  *
- * - LED matrix shows fluid level in a tank with sloshing physics
- * - When a cup is held within 100mm of the ToF sensor for 3 seconds,
- *   the ESP reads GPIO 1 & 2 to select which pump to activate:
- *     GPIO2=0, GPIO1=1 → Pump A (GPIO 18)
- *     GPIO2=1, GPIO1=0 → Pump B (GPIO 20)
- *     GPIO2=1, GPIO1=1 → Pump C (GPIO 19)
- *     GPIO2=0, GPIO1=0 → No selection, ignored
- * - Fluid drains 10% per dispense, then pump turns off
- * - BNO055 IMU drives sloshing/splash physics
+ * Each drink = carbonated water base + flavor syrup.
+ * Matrix displays the remaining carbonated water level.
  *
- * I2C addresses:
- *   BNO055  = 0x28  (ADR pin → GND)
- *   VL53L0X = 0x29  (default)
+ * Pumps:
+ *   GPIO  2 — Carbonated water pump (shared for all drinks)
+ *   GPIO 18 — Flavor pump A
+ *   GPIO 20 — Flavor pump B
+ *   GPIO 19 — Flavor pump C
  *
- * Build:
- *   idf.py set-target esp32c6
- *   idf.py build
- *   idf.py -p COMx flash monitor
+ * UART1 (GPIO 0 TX, GPIO 1 RX) communicates with another MCU:
+ *   RECEIVE: 'A' / 'B' / 'C' to select drink
+ *   SEND:    CUP, REMOVED, DISPENSING:X, NO_SELECTION, EMPTY, DONE, READY
+ *
+ * I2C:
+ *   BNO055  = 0x28, VL53L0X = 0x29
+ *
  */
 
 #include <cstdio>
@@ -31,6 +29,7 @@
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "driver/i2c_master.h"
 #include "led_strip.h"
 #include "bno055.h"
@@ -40,48 +39,64 @@
 static const char *TAG = "dispenser";
 
 // =============================================================================
-// Hardware config
+// Configs, definitions and params
 // =============================================================================
 
+// Hardware config
 #define LED_GPIO        21
 #define I2C_SDA_GPIO    22
 #define I2C_SCL_GPIO    23
+#define CARB_PUMP_GPIO  2       // carbonated water pump (shared)
+#define PUMP_A_GPIO     18      // flavor A pump
+#define PUMP_B_GPIO     20      // flavor B pump
+#define PUMP_C_GPIO     19      // flavor C pump
 
-// Pump outputs
-#define PUMP_A_GPIO     18      // GPIO2=0, GPIO1=1
-#define PUMP_B_GPIO     20      // GPIO2=1, GPIO1=0
-#define PUMP_C_GPIO     19      // GPIO2=1, GPIO1=1
+//UART Config
+#define UART_PORT       UART_NUM_1
+#define UART_TX_GPIO    0
+#define UART_RX_GPIO    1
+#define UART_BAUD       115200
+#define UART_BUF_SIZE   256
 
-// Drink selection inputs
-#define SELECT_GPIO_1    1
-#define SELECT_GPIO_2    2
-
+//I2C addresses
 #define BNO055_ADDR     0x28
 #define VL53L0X_ADDR    0x29
 
-// =============================================================================
-// LED matrix
-// =============================================================================
+// Tank & pump configuration
+// Carbonated water tank
+#define TANK_VOLUME_ML          2000.0f     // total tank capacity in mL
+#define CARB_FLOW_RATE_ML_S     50.0f       // carbonated water pump flow rate in mL/s
 
+// Pump run times per drink (in milliseconds)
+// Carbonated water pump time for each drink
+#define DRINK_A_CARB_TIME_MS    3000        
+#define DRINK_B_CARB_TIME_MS    3000        
+#define DRINK_C_CARB_TIME_MS    3000        
+
+// Flavor pump time for each drink
+#define DRINK_A_FLAVOR_TIME_MS  1500        
+#define DRINK_B_FLAVOR_TIME_MS  2000        
+#define DRINK_C_FLAVOR_TIME_MS  1000        
+
+// Dispense config
+#define CUP_DETECT_DIST_MM      100
+#define CUP_HOLD_TIME_MS        3000
+#define COOLDOWN_TIME_MS        2000
+ 
+// LED matrix config
 #define MATRIX_COLS     10
 #define MATRIX_ROWS     8
 #define NUM_LEDS        (MATRIX_COLS * MATRIX_ROWS)
 #define SERPENTINE      0
 #define BRIGHTNESS      20
 
-// =============================================================================
-// BNO055 startup
-// =============================================================================
 
+// BNO055 startup config
 #define BNO055_INIT_RETRIES     10
 #define BNO055_RETRY_DELAY_MS   500
 
-// =============================================================================
-// Simulation tuning
-// =============================================================================
-
+// Simulation params (very sensitive)
 #define SIM_FPS         60
-
 #define WAVE_SPEED      0.15f
 #define ACCEL_SCALE     0.006f
 #define DAMPING         0.995f
@@ -100,20 +115,7 @@ static const char *TAG = "dispenser";
 #define DROPLET_WATER       0.05f
 #define SURFACE_GLOW        0
 
-// =============================================================================
-// Dispense config
-// =============================================================================
-
-#define CUP_DETECT_DIST_MM      100
-#define CUP_HOLD_TIME_MS        3000
-#define DISPENSE_PERCENT         10
-#define PUMP_RUN_TIME_MS        2000
-#define COOLDOWN_TIME_MS        2000
-
-// =============================================================================
-// Shared state
-// =============================================================================
-
+// Shared state variables
 static volatile uint16_t g_tof_distance_mm = 0;
 static volatile bool     g_tof_valid = false;
 
@@ -125,9 +127,22 @@ typedef enum {
 } dispense_state_t;
 
 static volatile dispense_state_t g_dispense_state = DISPENSE_IDLE;
+static volatile char g_selected_drink = 0;
+
+// Tank level (in mL)
+static volatile float g_tank_remaining_ml = TANK_VOLUME_ML;
+
+// Tank level as fraction (0.0 – 1.0), updated by dispense logic
 static volatile float g_tank_level = 1.0f;
+
+// Drain
 static volatile bool  g_drain_requested = false;
-static volatile int   g_active_pump_gpio = -1;
+
+// Active pump tracking
+static volatile int   g_active_carb_gpio = -1;
+static volatile int   g_active_flavor_gpio = -1;
+static volatile int64_t g_carb_off_time = 0;     // timestamp (ms) to turn off carb pump
+static volatile int64_t g_flavor_off_time = 0;    // timestamp (ms) to turn off flavor pump
 
 // Water conservation tracker
 static float g_total_water = -1.0f;
@@ -147,7 +162,29 @@ static inline float randf_range(float lo, float hi) {
 }
 
 // =============================================================================
-// LED strip
+// UART
+// =============================================================================
+
+static void uart_init_port(void) {
+    uart_config_t uart_cfg = {};
+    uart_cfg.baud_rate  = UART_BAUD;
+    uart_cfg.data_bits  = UART_DATA_8_BITS;
+    uart_cfg.parity     = UART_PARITY_DISABLE;
+    uart_cfg.stop_bits  = UART_STOP_BITS_1;
+    uart_cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
+    uart_cfg.source_clk = UART_SCLK_DEFAULT;
+
+    uart_driver_install(UART_PORT, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0);
+    uart_param_config(UART_PORT, &uart_cfg);
+    uart_set_pin(UART_PORT, UART_TX_GPIO, UART_RX_GPIO, -1, -1);
+}
+
+static void uart_send(const char *msg) {
+    uart_write_bytes(UART_PORT, msg, strlen(msg));
+}
+
+// =============================================================================
+// LED matrix
 // =============================================================================
 
 static led_strip_handle_t led_strip = NULL;
@@ -217,7 +254,7 @@ static void fb_flush(void) {
 }
 
 // =============================================================================
-// Shallow Water Simulation (with conservation + adaptive damping)
+// Shallow Water Simulation
 // =============================================================================
 
 static float h[MATRIX_COLS];
@@ -233,7 +270,6 @@ static void sim_init(float fill) {
 static void sim_update(float accel_horizontal) {
     float force = accel_horizontal * ACCEL_SCALE;
 
-    // Adaptive damping: heavier friction when water level is low
     float avg_h = g_total_water / MATRIX_COLS;
     float fill_ratio = clampf(avg_h / MATRIX_ROWS, 0.05f, 1.0f);
     float effective_damping = DAMPING * fill_ratio + (1.0f - fill_ratio) * 0.95f;
@@ -256,7 +292,6 @@ static void sim_update(float accel_horizontal) {
         h[i] = clampf(h[i], 0.0f, (float)MATRIX_ROWS);
     }
 
-    // Enforce water conservation — fix phantom water from clamping
     float current_total = 0;
     for (int i = 0; i < MATRIX_COLS; i++) current_total += h[i];
     if (g_total_water >= 0 && current_total > 0.01f) {
@@ -273,7 +308,8 @@ static void sim_drain_toward(float target_fill) {
 
     if (avg_current <= target_h) return;
 
-    float drain_rate = (avg_current - target_h) / (PUMP_RUN_TIME_MS / 16.0f);
+    // Drain smoothly over 2 seconds (120 frames at 60fps)
+    float drain_rate = (avg_current - target_h) / 120.0f;
     float scale = 1.0f - (drain_rate / fmaxf(avg_current, 0.01f));
     scale = clampf(scale, 0.95f, 1.0f);
 
@@ -282,13 +318,12 @@ static void sim_drain_toward(float target_fill) {
         if (h[i] < 0) h[i] = 0;
     }
 
-    // Update conservation target to match new lower level
     g_total_water = 0;
     for (int i = 0; i < MATRIX_COLS; i++) g_total_water += h[i];
 }
 
 // =============================================================================
-// Splash Particles (water-conserving)
+// Splash Particles
 // =============================================================================
 
 typedef struct {
@@ -372,7 +407,7 @@ static void particles_spawn(float accel_mag, float accel_horizontal) {
 }
 
 // =============================================================================
-// Rendering
+// Render engine
 // =============================================================================
 
 static void render(void) {
@@ -392,13 +427,6 @@ static void render(void) {
                 r = (uint8_t)(180 * frac);
                 g = (uint8_t)(220 * frac);
                 b = (uint8_t)(255 * frac);
-            } else if (row <= surface_row + SURFACE_GLOW) {
-                float dist = (float)(row - surface_row);
-                float falloff = fmaxf(0.0f, 1.0f - dist / (SURFACE_GLOW + 1.0f));
-                falloff *= frac;
-                r = (uint8_t)(40 * falloff);
-                g = (uint8_t)(80 * falloff);
-                b = (uint8_t)(120 * falloff);
             } else {
                 r = 0; g = 0; b = 1;
             }
@@ -468,7 +496,7 @@ static void error_blink_red(void) {
 }
 
 // =============================================================================
-// BNO055 init with retry
+// BNO055 initialization routine
 // =============================================================================
 
 static bno055_t imu = {};
@@ -477,7 +505,7 @@ static void bno055_init_with_retry(i2c_master_dev_handle_t dev_handle) {
     imu.config.slave_handle = dev_handle;
     imu.config.reset.method = RESET_SW;
 
-    ESP_LOGI(TAG, "Waiting for BNO055...");
+    ESP_LOGI(TAG, "Looking for BNO055");
     for (int attempt = 1; attempt <= BNO055_INIT_RETRIES; attempt++) {
         for (int i = 0; i < NUM_LEDS; i++)
             led_strip_set_pixel(led_strip, i, 0, 0, 30);
@@ -485,7 +513,7 @@ static void bno055_init_with_retry(i2c_master_dev_handle_t dev_handle) {
 
         esp_err_t ret = bno055_initialize(&imu);
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "BNO055 detected on attempt %d!", attempt);
+            ESP_LOGI(TAG, "BNO055 detected");
             led_strip_clear(led_strip);
             led_strip_refresh(led_strip);
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -501,7 +529,7 @@ static void bno055_init_with_retry(i2c_master_dev_handle_t dev_handle) {
 }
 
 // =============================================================================
-// Task 1: Fluid Simulation
+// Fluid Sim task
 // =============================================================================
 
 static void fluid_task(void *arg) {
@@ -519,7 +547,7 @@ static void fluid_task(void *arg) {
         if (g_drain_requested) {
             g_drain_requested = false;
             drain_target = g_tank_level;
-            ESP_LOGI(TAG, "Draining to %.0f%%", drain_target * 100.0f);
+            ESP_LOGI(TAG, "Draining to %.1f%%", drain_target * 100.0f);
         }
 
         if (drain_target >= 0.0f) {
@@ -543,7 +571,7 @@ static void fluid_task(void *arg) {
 
         sim_update(accel_horizontal);
         particles_spawn(accel_mag, accel_horizontal);
-        particles_update(accel_horizontal, ax);
+        particles_update(accel_horizontal, ay);
         render();
         led_strip_refresh(led_strip);
 
@@ -558,30 +586,87 @@ static void fluid_task(void *arg) {
                 default: break;
             }
 
-            ESP_LOGI(TAG, "Tank: %.0f%% | ToF: %s%d mm | State: %s | Pump GPIO: %d",
+            ESP_LOGI(TAG, "Tank: %.0f mL (%.0f%%) | ToF: %s%d mm | State: %s | Drink: %c",
+                g_tank_remaining_ml,
                 g_tank_level * 100.0f,
                 g_tof_valid ? "" : "-- ",
                 g_tof_valid ? (int)g_tof_distance_mm : 0,
                 state_str,
-                (int)g_active_pump_gpio);
+                g_selected_drink ? g_selected_drink : '-');
         }
     }
 }
 
 // =============================================================================
-// Task 2: ToF + Dispense State Machine (with drink selection)
+// UART comms task
+// =============================================================================
+
+static void uart_rx_task(void *arg) {
+    uint8_t buf[32];
+
+    while (1) {
+        int len = uart_read_bytes(UART_PORT, buf, sizeof(buf) - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                char c = (char)buf[i];
+                if (c == 'A' || c == 'a') {
+                    g_selected_drink = 'A';
+                    ESP_LOGI(TAG, "UART: Drink A selected");
+                } else if (c == 'B' || c == 'b') {
+                    g_selected_drink = 'B';
+                    ESP_LOGI(TAG, "UART: Drink B selected");
+                } else if (c == 'C' || c == 'c') {
+                    g_selected_drink = 'C';
+                    ESP_LOGI(TAG, "UART: Drink C selected");
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Pump timing lookup helper
+// =============================================================================
+
+static void get_drink_timings(char drink, int *carb_ms, int *flavor_ms, int *flavor_gpio) {
+    switch (drink) {
+        case 'A':
+            *carb_ms    = DRINK_A_CARB_TIME_MS;
+            *flavor_ms  = DRINK_A_FLAVOR_TIME_MS;
+            *flavor_gpio = PUMP_A_GPIO;
+            break;
+        case 'B':
+            *carb_ms    = DRINK_B_CARB_TIME_MS;
+            *flavor_ms  = DRINK_B_FLAVOR_TIME_MS;
+            *flavor_gpio = PUMP_B_GPIO;
+            break;
+        case 'C':
+            *carb_ms    = DRINK_C_CARB_TIME_MS;
+            *flavor_ms  = DRINK_C_FLAVOR_TIME_MS;
+            *flavor_gpio = PUMP_C_GPIO;
+            break;
+        default:
+            *carb_ms = 0;
+            *flavor_ms = 0;
+            *flavor_gpio = -1;
+            break;
+    }
+}
+
+// =============================================================================
+// ToF + Dispense task
 // =============================================================================
 
 static void tof_task(void *arg) {
     VL53L0X sensor;
     sensor.setTimeout(500);
 
-    ESP_LOGI(TAG, "Waiting for VL53L0X...");
+    ESP_LOGI(TAG, "Initializing VL53L0X");
     bool initialized = false;
     for (int attempt = 1; attempt <= 10; attempt++) {
         if (sensor.init()) {
             initialized = true;
-            ESP_LOGI(TAG, "VL53L0X initialized on attempt %d!", attempt);
+            ESP_LOGI(TAG, "VL53L0X initialized");
             break;
         }
         ESP_LOGW(TAG, "VL53L0X init attempt %d/10 failed", attempt);
@@ -589,28 +674,22 @@ static void tof_task(void *arg) {
     }
 
     if (!initialized) {
-        ESP_LOGE(TAG, "VL53L0X not found! Dispense disabled.");
+        ESP_LOGE(TAG, "VL53L0X not initialized.");
         vTaskDelete(NULL);
         return;
     }
 
-    // Init pump outputs
+    // Init all pump GPIOs
+    gpio_set_direction((gpio_num_t)CARB_PUMP_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)PUMP_A_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)PUMP_B_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)PUMP_C_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)0, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)CARB_PUMP_GPIO, 0);
     gpio_set_level((gpio_num_t)PUMP_A_GPIO, 0);
     gpio_set_level((gpio_num_t)PUMP_B_GPIO, 0);
     gpio_set_level((gpio_num_t)PUMP_C_GPIO, 0);
 
-    // Init selection inputs with pull-down
-    gpio_set_direction((gpio_num_t)SELECT_GPIO_1, GPIO_MODE_INPUT);
-    gpio_set_direction((gpio_num_t)SELECT_GPIO_2, GPIO_MODE_INPUT);
-    gpio_pulldown_en((gpio_num_t)SELECT_GPIO_1);
-    gpio_pulldown_en((gpio_num_t)SELECT_GPIO_2);
-
     int64_t cup_first_seen = 0;
-    int64_t pump_start_time = 0;
     int64_t cooldown_start = 0;
 
     while (1) {
@@ -628,84 +707,116 @@ static void tof_task(void *arg) {
         switch (g_dispense_state) {
 
             case DISPENSE_IDLE:
-                if (cup_present && g_tank_level > 0.01f) {
+                if (cup_present && g_tank_remaining_ml > 1.0f) {
                     cup_first_seen = now;
                     g_dispense_state = DISPENSE_CUP_DETECTED;
-                    ESP_LOGI(TAG, "Cup detected! Hold for %d seconds...", CUP_HOLD_TIME_MS / 1000);
+                    uart_send("CUP\n");
+                    ESP_LOGI(TAG, "Cup detected! Hold for %d seconds", CUP_HOLD_TIME_MS / 1000);
                 }
                 break;
 
             case DISPENSE_CUP_DETECTED:
                 if (!cup_present) {
                     g_dispense_state = DISPENSE_IDLE;
+                    uart_send("REMOVED\n");
                     ESP_LOGI(TAG, "Cup removed, resetting.");
                 } else if ((now - cup_first_seen) >= CUP_HOLD_TIME_MS) {
-                    if (g_tank_level <= 0.01f) {
-                        ESP_LOGW(TAG, "Tank empty! Cannot dispense.");
+                    if (g_tank_remaining_ml <= 1.0f) {
+                        uart_send("EMPTY\n");
+                        ESP_LOGW(TAG, "Tank empty!");
                         g_dispense_state = DISPENSE_IDLE;
                     } else {
-                        // Read drink selection pins
-                        int sel1 = gpio_get_level((gpio_num_t)SELECT_GPIO_1);
-                        int sel2 = gpio_get_level((gpio_num_t)SELECT_GPIO_2);
+                        char sel = g_selected_drink;
+                        int carb_ms, flavor_ms, flavor_gpio;
+                        get_drink_timings(sel, &carb_ms, &flavor_ms, &flavor_gpio);
 
-                        int pump_gpio = -1;
-                        const char *drink_name = "NONE";
-
-                        if (sel2 == 1 && sel1 == 0) {
-                            pump_gpio = PUMP_A_GPIO;
-                            drink_name = "A";
-                        } else if (sel2 == 0 && sel1 == 1) {
-                            pump_gpio = PUMP_B_GPIO;
-                            drink_name = "B";
-                        } else if (sel2 == 1 && sel1 == 1) {
-                            pump_gpio = PUMP_C_GPIO;
-                            drink_name = "C";
-                        }
-
-                        if (pump_gpio < 0) {
-                            ESP_LOGW(TAG, "No drink selected (sel1=%d sel2=%d), ignoring.", sel1, sel2);
+                        if (flavor_gpio < 0) {
+                            uart_send("NO_SELECTION\n");
+                            ESP_LOGW(TAG, "No drink selected over UART.");
                             g_dispense_state = DISPENSE_IDLE;
                         } else {
-                            g_dispense_state = DISPENSE_PUMPING;
-                            pump_start_time = now;
-                            g_active_pump_gpio = pump_gpio;
+                            // Calculate how much carbonated water this dispense uses
+                            float carb_volume_ml = CARB_FLOW_RATE_ML_S * (carb_ms / 1000.0f);
 
-                            gpio_set_level((gpio_num_t)pump_gpio, 1);
+                            // Check if enough water remains
+                            if (carb_volume_ml > g_tank_remaining_ml) {
+                                uart_send("EMPTY\n");
+                                ESP_LOGW(TAG, "Not enough water for drink %c (need %.0f mL, have %.0f mL)",
+                                         sel, carb_volume_ml, g_tank_remaining_ml);
+                                g_dispense_state = DISPENSE_IDLE;
+                            } else {
+                                g_dispense_state = DISPENSE_PUMPING;
 
-                            float new_level = g_tank_level - (DISPENSE_PERCENT / 100.0f);
-                            if (new_level < 0) new_level = 0;
-                            g_tank_level = new_level;
-                            g_drain_requested = true;
+                                // Turn on both pumps
+                                gpio_set_level((gpio_num_t)CARB_PUMP_GPIO, 1);
+                                gpio_set_level((gpio_num_t)flavor_gpio, 1);
+                                g_active_carb_gpio = CARB_PUMP_GPIO;
+                                g_active_flavor_gpio = flavor_gpio;
 
-                            ESP_LOGI(TAG, "DISPENSING drink %s! Pump GPIO %d ON. Tank -> %.0f%%",
-                                     drink_name, pump_gpio, g_tank_level * 100.0f);
+                                // Schedule turn-off times
+                                g_carb_off_time = now + carb_ms;
+                                g_flavor_off_time = now + flavor_ms;
+
+                                // Update tank volume
+                                g_tank_remaining_ml -= carb_volume_ml;
+                                if (g_tank_remaining_ml < 0) g_tank_remaining_ml = 0;
+                                g_tank_level = g_tank_remaining_ml / TANK_VOLUME_ML;
+
+                                // Trigger fluid animation drain
+                                g_drain_requested = true;
+
+                                char msg[32];
+                                snprintf(msg, sizeof(msg), "DISPENSING:%c\n", sel);
+                                uart_send(msg);
+                                ESP_LOGI(TAG, "DISPENSING %c! Carb %dms, Flavor %dms. Tank: %.0f mL (%.0f%%)",
+                                         sel, carb_ms, flavor_ms,
+                                         g_tank_remaining_ml, g_tank_level * 100.0f);
+                            }
                         }
                     }
                 }
                 break;
 
-            case DISPENSE_PUMPING:
-                if ((now - pump_start_time) >= PUMP_RUN_TIME_MS) {
-                if (g_active_pump_gpio >= 0) {
-                    gpio_set_level((gpio_num_t)g_active_pump_gpio, 0);
+            case DISPENSE_PUMPING: {
+                // Turn off each pump
+                bool carb_done = true;
+                bool flavor_done = true;
+
+                if (g_active_carb_gpio >= 0) {
+                    if (now >= g_carb_off_time) {
+                        gpio_set_level((gpio_num_t)g_active_carb_gpio, 0);
+                        ESP_LOGI(TAG, "Carbonated water pump OFF");
+                        g_active_carb_gpio = -1;
+                    } else {
+                        carb_done = false;
+                    }
                 }
-                g_active_pump_gpio = -1;
 
-                // Pulse GPIO 0 high for 1 second
-                gpio_set_level((gpio_num_t)0, 1);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                gpio_set_level((gpio_num_t)0, 0);
+                if (g_active_flavor_gpio >= 0) {
+                    if (now >= g_flavor_off_time) {
+                        gpio_set_level((gpio_num_t)g_active_flavor_gpio, 0);
+                        ESP_LOGI(TAG, "Flavor pump OFF");
+                        g_active_flavor_gpio = -1;
+                    } else {
+                        flavor_done = false;
+                    }
+                }
 
-                cooldown_start = esp_timer_get_time() / 1000;  // refresh timestamp after delay
-                g_dispense_state = DISPENSE_COOLDOWN;
-                ESP_LOGI(TAG, "Pump OFF. GPIO 0 pulsed. Cooldown...");
+                // Both pumps done → move to cooldown
+                if (carb_done && flavor_done) {
+                    g_selected_drink = 0;
+                    uart_send("DONE\n");
+                    ESP_LOGI(TAG, "Dispense complete.");
+                    cooldown_start = now;
+                    g_dispense_state = DISPENSE_COOLDOWN;
                 }
                 break;
-
+            }
 
             case DISPENSE_COOLDOWN:
                 if ((now - cooldown_start) >= COOLDOWN_TIME_MS) {
                     g_dispense_state = DISPENSE_IDLE;
+                    uart_send("READY\n");
                     ESP_LOGI(TAG, "Ready for next cup.");
                 }
                 break;
@@ -716,12 +827,15 @@ static void tof_task(void *arg) {
 }
 
 // =============================================================================
-// app_main
+// main
 // =============================================================================
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Drink Dispenser Starting ===");
+    ESP_LOGI(TAG, "Flics Starting");
+
+    uart_init_port();
+    ESP_LOGI(TAG, "UART1 initialized on TX=GPIO%d, RX=GPIO%d", UART_TX_GPIO, UART_RX_GPIO);
 
     led_init();
 
@@ -756,15 +870,17 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     startup_animation();
-
     sim_init(1.0f);
     particles_init();
 
-    xTaskCreate(fluid_task, "fluid", 8192, NULL, 5, NULL);
-    xTaskCreate(tof_task,   "tof",   4096, NULL, 4, NULL);
+    xTaskCreate(fluid_task,   "fluid",   8192, NULL, 5, NULL);
+    xTaskCreate(tof_task,     "tof",     4096, NULL, 4, NULL);
+    xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 3, NULL);
 
-    ESP_LOGI(TAG, "Dispenser ready! Tank at 100%%");
-    ESP_LOGI(TAG, "Hold cup within %d mm for %d seconds to dispense.", CUP_DETECT_DIST_MM, CUP_HOLD_TIME_MS / 1000);
-    ESP_LOGI(TAG, "Drink selection: GPIO2=0,GPIO1=1 -> A (GPIO%d) | GPIO2=1,GPIO1=0 -> B (GPIO%d) | GPIO2=1,GPIO1=1 -> C (GPIO%d)",
-             PUMP_A_GPIO, PUMP_B_GPIO, PUMP_C_GPIO);
+    uart_send("READY\n");
+    ESP_LOGI(TAG, "Tank: %.0f mL | Flow rate: %.0f mL/s", TANK_VOLUME_ML, CARB_FLOW_RATE_ML_S);
+    ESP_LOGI(TAG, "Drink A: carb %dms, flavor %dms", DRINK_A_CARB_TIME_MS, DRINK_A_FLAVOR_TIME_MS);
+    ESP_LOGI(TAG, "Drink B: carb %dms, flavor %dms", DRINK_B_CARB_TIME_MS, DRINK_B_FLAVOR_TIME_MS);
+    ESP_LOGI(TAG, "Drink C: carb %dms, flavor %dms", DRINK_C_CARB_TIME_MS, DRINK_C_FLAVOR_TIME_MS);
+    ESP_LOGI(TAG, "Dispenser ready!");
 }
