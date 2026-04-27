@@ -921,7 +921,7 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     startup_animation();
-    sim_init(0.5f);
+    sim_init(1.0f);
     particles_init();
 
     xTaskCreate(fluid_task,   "fluid",   8192, NULL, 5, NULL);
