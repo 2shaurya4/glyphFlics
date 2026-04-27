@@ -66,34 +66,34 @@ static const char *TAG = "dispenser";
 // ===================
 
 // Carbonated water tank
-#define TANK_VOLUME_ML          2000.0f     // total capacity in mL
-#define CARB_FLOW_RATE_ML_S     50.0f       // pump flow rate in mL/s
+#define TANK_VOLUME_ML          2000.0f     // total capacity in mL [NEEDS UPDATING]
+#define CARB_FLOW_RATE_ML_S     9.0f       // pump flow rate in mL/s
 
-// Flavor tank volumes (mL)
+// Flavor tank volumes (mL) [NEEDS UPDATING]
 #define FLAVOR_A_VOLUME_ML      500.0f
 #define FLAVOR_B_VOLUME_ML      500.0f
 #define FLAVOR_C_VOLUME_ML      500.0f
 
 // Flavor pump flow rates (mL/s)
-#define FLAVOR_A_FLOW_RATE_ML_S 10.0f
-#define FLAVOR_B_FLOW_RATE_ML_S 10.0f
-#define FLAVOR_C_FLOW_RATE_ML_S 10.0f
+#define FLAVOR_A_FLOW_RATE_ML_S 1.91f
+#define FLAVOR_B_FLOW_RATE_ML_S 1.91f
+#define FLAVOR_C_FLOW_RATE_ML_S 1.91f
 
 // Carbonated water pump time per drink (ms)
-#define DRINK_A_CARB_TIME_MS    3000
-#define DRINK_B_CARB_TIME_MS    3000
-#define DRINK_C_CARB_TIME_MS    3000
+#define DRINK_A_CARB_TIME_MS    18470
+#define DRINK_B_CARB_TIME_MS    18470
+#define DRINK_C_CARB_TIME_MS    18470
 
 // Flavor pump time per drink (ms)
-#define DRINK_A_FLAVOR_TIME_MS  1500
-#define DRINK_B_FLAVOR_TIME_MS  2000
-#define DRINK_C_FLAVOR_TIME_MS  1000
+#define DRINK_A_FLAVOR_TIME_MS  4580
+#define DRINK_B_FLAVOR_TIME_MS  4580
+#define DRINK_C_FLAVOR_TIME_MS  4580
 
 // ====================
 // Dispense preferences
 // ====================
 
-#define CUP_DETECT_DIST_MM      100
+#define CUP_DETECT_DIST_MM      100   //[NEEDS UPDATING]
 #define CUP_HOLD_TIME_MS        3000
 #define COOLDOWN_TIME_MS        2000
 
@@ -442,15 +442,15 @@ static void render(void) {
             uint8_t r, g, b;
             if (row < surface_row) {
                 float depth_ratio = (float)row / fmaxf(1.0f, water_h);
-                r = (uint8_t)(depth_ratio * 10);
-                g = (uint8_t)(10 + depth_ratio * 60);
-                b = (uint8_t)(40 + depth_ratio * 160);
+                r = (uint8_t)(80 + depth_ratio * 175);   
+                g = (uint8_t)(depth_ratio * 100);          
+                b = (uint8_t)(depth_ratio * 10);           
             } else if (row == surface_row) {
-                r = (uint8_t)(180 * frac);
-                g = (uint8_t)(220 * frac);
-                b = (uint8_t)(255 * frac);
+                r = (uint8_t)(255 * frac);
+                g = (uint8_t)(200 * frac);
+                b = (uint8_t)(30 * frac);
             } else {
-                r = 0; g = 0; b = 1;
+                r = 1; g = 0; b = 0;
             }
             fb_set(col, row, r, g, b);
         }
@@ -461,9 +461,9 @@ static void render(void) {
         int px = (int)(p->x + 0.5f);
         int py = (int)(p->y + 0.5f);
         float brightness = clampf(p->life, 0.0f, 1.0f);
-        uint8_t dr = (uint8_t)(100 * brightness);
-        uint8_t dg = (uint8_t)(130 * brightness);
-        uint8_t db = (uint8_t)(160 * brightness);
+        uint8_t dr = (uint8_t)(200 * brightness);
+        uint8_t dg = (uint8_t)(160 * brightness);
+        uint8_t db = (uint8_t)(20 * brightness);
         fb_add(px, py, dr, dg, db);
         if (fabsf(p->vy) > 0.1f || fabsf(p->vx) > 0.1f) {
             int tx = px - (p->vx > 0 ? 1 : (p->vx < 0 ? -1 : 0));
@@ -493,9 +493,9 @@ static void startup_animation(void) {
             for (int row = 0; row <= fill_row; row++) {
                 float depth_ratio = (float)row / fmaxf(1.0f, target);
                 fb_set(col, row,
-                    (uint8_t)(depth_ratio * 10),
-                    (uint8_t)(10 + depth_ratio * 60),
-                    (uint8_t)(40 + depth_ratio * 160));
+                    (uint8_t)(80 + depth_ratio * 175),
+                    (uint8_t)(depth_ratio * 100),
+                    (uint8_t)(depth_ratio * 10));
             }
         }
         fb_flush();
@@ -865,7 +865,7 @@ static void tof_task(void *arg) {
             }
 
             case DISPENSE_COOLDOWN:
-                if ((now - cooldown_start) >= COOLDOWN_TIME_MS) {
+                if ((now - cooldown_start) >= COOLDOWN_TIME_MS && !cup_present) {
                     g_dispense_state = DISPENSE_IDLE;
                     uart_send("READY\n");
                     ESP_LOGI(TAG, "Ready for next cup.");
@@ -921,7 +921,7 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     startup_animation();
-    sim_init(1.0f);
+    sim_init(0.5f);
     particles_init();
 
     xTaskCreate(fluid_task,   "fluid",   8192, NULL, 5, NULL);

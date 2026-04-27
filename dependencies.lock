@@ -22,10 +22,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.3
+    version: 6.0.0
 direct_dependencies:
 - adithya-187326/bno055
 - espressif/led_strip
 manifest_hash: ca42d99d81e0380683732c4ede9e2873989ff6b644078e07adfed1811197e552
 target: esp32c6
-version: 2.0.0
+version: 3.0.0
