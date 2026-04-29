@@ -445,11 +445,18 @@ static void render(void) {
                 r = (uint8_t)(80 + depth_ratio * 175);   
                 g = (uint8_t)(depth_ratio * 100);          
                 b = (uint8_t)(depth_ratio * 10);           
+                r = (uint8_t)(80 + depth_ratio * 175);   
+                g = (uint8_t)(depth_ratio * 100);          
+                b = (uint8_t)(depth_ratio * 10);           
             } else if (row == surface_row) {
                 r = (uint8_t)(255 * frac);
                 g = (uint8_t)(200 * frac);
                 b = (uint8_t)(30 * frac);
+                r = (uint8_t)(255 * frac);
+                g = (uint8_t)(200 * frac);
+                b = (uint8_t)(30 * frac);
             } else {
+                r = 1; g = 0; b = 0;
                 r = 1; g = 0; b = 0;
             }
             fb_set(col, row, r, g, b);
@@ -461,6 +468,9 @@ static void render(void) {
         int px = (int)(p->x + 0.5f);
         int py = (int)(p->y + 0.5f);
         float brightness = clampf(p->life, 0.0f, 1.0f);
+        uint8_t dr = (uint8_t)(200 * brightness);
+        uint8_t dg = (uint8_t)(160 * brightness);
+        uint8_t db = (uint8_t)(20 * brightness);
         uint8_t dr = (uint8_t)(200 * brightness);
         uint8_t dg = (uint8_t)(160 * brightness);
         uint8_t db = (uint8_t)(20 * brightness);
@@ -493,6 +503,9 @@ static void startup_animation(void) {
             for (int row = 0; row <= fill_row; row++) {
                 float depth_ratio = (float)row / fmaxf(1.0f, target);
                 fb_set(col, row,
+                    (uint8_t)(80 + depth_ratio * 175),
+                    (uint8_t)(depth_ratio * 100),
+                    (uint8_t)(depth_ratio * 10));
                     (uint8_t)(80 + depth_ratio * 175),
                     (uint8_t)(depth_ratio * 100),
                     (uint8_t)(depth_ratio * 10));
@@ -865,6 +878,7 @@ static void tof_task(void *arg) {
             }
 
             case DISPENSE_COOLDOWN:
+                if ((now - cooldown_start) >= COOLDOWN_TIME_MS && !cup_present) {
                 if ((now - cooldown_start) >= COOLDOWN_TIME_MS && !cup_present) {
                     g_dispense_state = DISPENSE_IDLE;
                     uart_send("READY\n");

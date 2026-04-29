@@ -4,7 +4,7 @@
     "board/esp32c6-builtin.cfg"
   ],
   "idf.portWin": "COM9",
-  "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
+  "idf.currentSetup": "C:\\esp\\v6.0\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"
   },
