@@ -1,0 +1,26 @@
+menu "BNO055 Configuration"
+
+    config BNO055_I2C_FREQUENCY
+        int "I2C bus frequency (kHz)"
+        default 400
+        range 1 400
+
+    config BNO055_I2C_ADDR
+        hex "I2C address (0x28 or 0x29)"
+        default 0x28
+        help
+            0x28 when ADR pin is low. 0x29 when ADR is high.
+    
+    config BNO055_SDA_PIN
+        int "GPIO number of the SDA pin"
+        default 2
+    
+    config BNO055_SCL_PIN
+            int "GPIO number of the SCL pin"
+        default 3
+    
+    config BNO055_RESET_PIN
+        int "GPIO number of the RESET pin"
+        default -1
+
+endmenu

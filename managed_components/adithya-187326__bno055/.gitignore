@@ -1,0 +1,14 @@
+# IDF
+build/
+sdkconfig
+sdkconfig.old
+.DS_Store
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Artifacts
+dist/
+*.zip
+*.tar.gz
